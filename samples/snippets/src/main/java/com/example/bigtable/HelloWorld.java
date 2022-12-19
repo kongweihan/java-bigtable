@@ -29,6 +29,7 @@ import com.google.cloud.bigtable.admin.v2.BigtableTableAdminSettings;
 import com.google.cloud.bigtable.admin.v2.models.CreateTableRequest;
 import com.google.cloud.bigtable.data.v2.BigtableDataClient;
 import com.google.cloud.bigtable.data.v2.BigtableDataSettings;
+import com.google.cloud.bigtable.data.v2.models.Filters;
 import com.google.cloud.bigtable.data.v2.models.Filters.ChainFilter;
 import com.google.cloud.bigtable.data.v2.models.Filters.Filter;
 import com.google.cloud.bigtable.data.v2.models.KeyOffset;
@@ -51,13 +52,19 @@ import java.io.IOException;
 import java.security.SecureRandom;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Random;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.IntConsumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import javax.management.relation.RelationNotFoundException;
 
 // [END bigtable_hw_imports]
@@ -124,7 +131,6 @@ public class HelloWorld {
 
   public void run() throws Exception {
     System.out.println("Running HelloWorld");
-    List<String> rowkeys = loadRowKeys("rowkeys.txt");
 
     // sampleRowKeys();
     // readRange("9985", "9991");
@@ -141,11 +147,15 @@ public class HelloWorld {
     // batchMutation();
 
     // readSpecificCells();
-    // readTable(1);
+    readTable(1);
     // deleteSingleRow("bigrow");
     // deleteTable();
 
-    readRandomRows(rowkeys, 200, 60 * 5);
+    // System.out.println(System.getProperty("user.dir"));
+    // List<String> rowkeys = loadRowKeys("rowkeys.txt");
+    // List<String> families = loadColumnFamily(rowkeys.get(0));
+    // List<String> columns = loadColumns(rowkeys.get(0));
+    // readRandomRows(rowkeys, families.get(0), columns, 100, 60 * 5, 2000);
 
     // testGson();
 
@@ -172,6 +182,29 @@ public class HelloWorld {
     System.out.println("Loaded " + list.size() + " rowkeys.");
 
     return list;
+  }
+
+  List<String> loadColumnFamily(String rowkey) {
+    Set<String> columnFamilies = Sets.newHashSet();
+    Row row = dataClient.readRow(tableId, rowkey);
+    for (RowCell cell : row.getCells()) {
+      columnFamilies.add(cell.getFamily());
+    }
+    System.out.println("Families: " + columnFamilies);
+    return Lists.newArrayList(columnFamilies);
+  }
+
+  List<String> loadColumns(String rowkey) {
+    List<String> columns = Lists.newArrayList();
+    Row row = dataClient.readRow(tableId, rowkey);
+    for (RowCell cell : row.getCells()) {
+      String qualifier = cell.getQualifier().toStringUtf8();
+      if (!qualifier.contains("rep")) {
+        columns.add(cell.getQualifier().toStringUtf8());
+      }
+    }
+    System.out.println("Columns: " + columns);
+    return columns;
   }
 
   public void sampleRowKeys() {
@@ -400,31 +433,39 @@ public class HelloWorld {
   /**
    * Demonstrates how to read an entire table.
    */
+  public void readTable() {
+    readTable(Integer.MAX_VALUE);
+  }
+
   public void readTable(int rowsLimit) {
     // [START bigtable_hw_scan_all]
     try {
       System.out.println("\nReading first " + rowsLimit + " rows in table " + tableId);
-      Query query = Query.create(tableId).limit(1000000);
+      Query query = Query.create(tableId).limit(rowsLimit);
       // Query query = Query.create(tableId).limit(rowsLimit);
       ServerStream<Row> rowStream = dataClient.readRows(query);
       int rowNum = 0;
       for (Row r : rowStream) {
         System.out.println("Row Key: " + r.getKey().toStringUtf8());
         rowNum++;
-        int colCount = 0;
+        int cellCount = 0;
         int rowSize = 0;
         for (RowCell cell : r.getCells()) {
-          colCount++;
-          rowSize += cell.getQualifier().size() + cell.getValue().size() + 8;
-          // System.out.printf(
-          //     "Family: %s    Qualifier: %s (%d bytes)   Value: %s (%d bytes)  TS: %d (%d bytes)  Total size: %d bytes\n",
-          //     cell.getFamily(), cell.getQualifier().toStringUtf8(), cell.getQualifier().size(),
-          //     cell.getValue().toStringUtf8(),
-          //     cell.getValue().size(), cell.getTimestamp(), 8, cell.getQualifier().size() + cell.getValue().size() + 8);
+          cellCount++;
+          int cellSize = r.getKey().size() + cell.getFamily().length() + cell.getQualifier().size()
+              + cell.getValue().size() + 8;
+          System.out.printf(
+              "Rowkey: %s (%d bytes)  Family: %s (%d bytes)   Qualifier: %s (%d bytes)   Value: %s (%d bytes)  TS: %d (%d bytes)  Total cell size: %d bytes\n",
+              r.getKey().toStringUtf8(), r.getKey().size(), cell.getFamily(),
+              cell.getFamily().length(), cell.getQualifier().toStringUtf8(),
+              cell.getQualifier().size(),
+              cell.getValue().toStringUtf8(),
+              cell.getValue().size(), cell.getTimestamp(), 8, cellSize);
+          rowSize += cellSize;
         }
-        // System.out.println("Number of columns: " + colCount + " row size: " + rowSize + " bytes");
-        System.out.println("row " + rowNum);
+        System.out.println("Number of cells: " + cellCount + " row size: " + rowSize + " bytes");
       }
+      System.out.println("row " + rowNum);
       return;
     } catch (NotFoundException e) {
       System.err.println("Failed to read a non-existent table: " + e.getMessage());
@@ -468,15 +509,62 @@ public class HelloWorld {
     BigtableDataClient dataClient;
     String tableId;
     List<String> rowkeys;
+    String family;
+    List<String> columns;
+    int numColumns;
 
     ReadRandomRowsRunnable(String name, int duration_seconds, BigtableDataClient dataClient,
-        String tableId, List<String> rowkeys) {
+        String tableId, List<String> rowkeys, String family, List<String> columns, int numColumns) {
       threadName = name;
       this.duration_seconds = duration_seconds;
       this.dataClient = dataClient;
       this.tableId = tableId;
       this.rowkeys = rowkeys;
-      System.out.printf("Creating thread %s, table=%s, duration=%d\n", threadName, tableId, duration_seconds);
+      this.family = family;
+      this.columns = columns;
+      this.numColumns = numColumns;
+      System.out.printf("Creating thread %s, table=%s, duration=%d\n", threadName, tableId,
+          duration_seconds);
+    }
+
+    List<String> getRandomColumns(List<String> columns, int numColumns) {
+
+      List<Integer> ints = Lists.newArrayList();
+
+      IntConsumer consumer = a -> ints.add(a);
+
+      ThreadLocalRandom.current()
+          .ints(0, 1000).distinct().limit(numColumns / 5)
+          .forEach(consumer);
+      Collections.sort(ints);
+      // System.out.println("kk89" + ints);
+      List<String> selectedColumns = Lists.newArrayList();
+      for (int i : ints) {
+        selectedColumns.add(columns.get(i));
+      }
+      System.out.println("Selected columns: " + selectedColumns);
+      return selectedColumns;
+    }
+
+    Filter createFilter(String family, List<String> columns) {
+      // If the needed columns have a common prefix:
+      // Filter f1 = FILTERS.qualifier().rangeWithinFamily("my-family")
+      //     .of(
+      //         ByteString.copyFromUtf8("col-prefix"),
+      //         ByteString.copyFromUtf8("col-preifx")
+      //             .concat(ByteString.copyFrom(new byte[]{0})));
+
+      // Using exact names or regex
+      Filters.InterleaveFilter interleaveFilter = FILTERS.interleave();
+      for (int i = 0; i < columns.size(); i++) {
+        // System.out.println("add qualifier regex=" + columns.get(i) + ".*");
+        // interleaveFilter.filter(FILTERS.qualifier().regex(columns.get(i) + ".*"));
+        interleaveFilter.filter(FILTERS.qualifier().exactMatch(columns.get(i)));
+      }
+
+      return FILTERS.chain()
+          .filter(FILTERS.family().exactMatch(family))
+          .filter(interleaveFilter);
     }
 
     @Override
@@ -487,16 +575,23 @@ public class HelloWorld {
 
         long requestCount = 0;
 
+        List<String> selectedColumns = getRandomColumns(columns, numColumns);
+
         Random rand = new Random();
 
         while (System.currentTimeMillis() < endTime) {
           if (System.currentTimeMillis() >= countTime) {
             countTime = System.currentTimeMillis() + 1000;
-            System.out.printf("Thread=%s time=%s requests=%d\n", threadName, new Timestamp(System.currentTimeMillis()), requestCount);
+            System.out.printf("Thread=%s time=%s requests=%d\n", threadName,
+                new Timestamp(System.currentTimeMillis()), requestCount);
             requestCount = 0;
           }
 
-          Row row = dataClient.readRow(tableId, rowkeys.get(rand.nextInt(rowkeys.size())));
+          Filter filter = createFilter(family, selectedColumns);
+
+          Row row = dataClient.readRow(tableId, rowkeys.get(rand.nextInt(rowkeys.size())), filter);
+          // System.out.println(row.getCells().size() + "\n\n\n");
+
           requestCount++;
 
           // System.out.printf("Thread %s rowkey %s\n", threadName, row.getKey().toStringUtf8());
@@ -522,14 +617,17 @@ public class HelloWorld {
     }
   }
 
-  public void readRandomRows(List<String> rowkeys, int num_threads, int duration_seconds)
+  public void readRandomRows(List<String> rowkeys, String family, List<String> columns,
+      int num_threads,
+      int duration_seconds, int numColumns)
       throws InterruptedException {
     // ExecutorService executor = Executors.newFixedThreadPool(50);
 
     List<ReadRandomRowsRunnable> runnables = Lists.newArrayList();
     for (int i = 0; i < num_threads; i++) {
-      ReadRandomRowsRunnable runnable = new ReadRandomRowsRunnable("t-" + i, duration_seconds, dataClient,
-          tableId, rowkeys);
+      ReadRandomRowsRunnable runnable = new ReadRandomRowsRunnable("t-" + i, duration_seconds,
+          dataClient,
+          tableId, rowkeys, family, columns, numColumns);
       runnable.start();
       runnables.add(runnable);
     }
